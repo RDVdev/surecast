@@ -49,3 +49,21 @@ pnpm-debug.log*
 *.sln
 *.sw?
 
+# Generated data outputs (reproducible via pipeline)
+data/cleaned_dataset.csv
+data/engineered_dataset.csv
+data/model_predictions.csv
+data/evaluation_metrics.csv
+data/evaluation_metrics.json
+data/predicted_vs_actual_dl.png
+data/target_scaler.pkl
+
+# Model artifacts
+models/
+
+# Generated reports
+reports/
+
+# Research papers
+*.pdf
+

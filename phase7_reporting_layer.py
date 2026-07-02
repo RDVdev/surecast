@@ -123,7 +123,7 @@ def main():
     
     set_seed(42)
 
-    data_path = "data/evaluation_metrics.json" # Assumed output from Phase 5
+    data_path = "data/evaluation_metrics.csv"  # Output from Phase 5
     if not os.path.exists(data_path):
         logging.error(f"[ERROR] NOT YET COMPUTED — requires {data_path} to generate reports.")
         logging.error("Please provide the DataCoSupplyChainDataset.csv and run Phases 1-5 first.")

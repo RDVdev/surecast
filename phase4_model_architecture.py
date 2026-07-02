@@ -211,6 +211,85 @@ def train_dl_branch(X_train, y_train, X_val, y_val, input_size, seq_len, active_
             val_targets.extend(y_b.squeeze(-1).numpy())
             
     mae = np.mean(np.abs(np.array(val_preds) - np.array(val_targets)))
+    return mae, np.array(val_preds), model
+
+
+# ==========================================
+# 1.5 STANDALONE TRANSFORMER BASELINE (1.2)
+# ==========================================
+
+class StandaloneTransformer(nn.Module):
+    def __init__(self, input_size, seq_len):
+        super(StandaloneTransformer, self).__init__()
+        self.proj = nn.Linear(input_size, 64)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=64, nhead=4, dim_feedforward=128, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.fc = nn.Linear(64, 1)
+
+    def forward(self, x):
+        t = self.proj(x)
+        t = self.transformer(t)
+        t = torch.mean(t, dim=1) # Global average pooling
+        out = self.fc(t)
+        return out
+
+def train_standalone_transformer(X_train, y_train, X_val, y_val, input_size, seq_len, epochs=100):
+    model = StandaloneTransformer(input_size=input_size, seq_len=seq_len)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.MSELoss()
+    
+    train_loader = DataLoader(TensorDataset(torch.tensor(X_train, dtype=torch.float32), 
+                                            torch.tensor(y_train, dtype=torch.float32).unsqueeze(-1)), 
+                              batch_size=512, shuffle=True)
+    val_loader = DataLoader(TensorDataset(torch.tensor(X_val, dtype=torch.float32), 
+                                          torch.tensor(y_val, dtype=torch.float32).unsqueeze(-1)), 
+                            batch_size=512, shuffle=False)
+                            
+    best_val_loss = float('inf')
+    patience = 15
+    patience_counter = 0
+    best_model_state = None
+                            
+    for epoch in range(epochs):
+        model.train()
+        for X_b, y_b in train_loader:
+            optimizer.zero_grad()
+            mu = model(X_b)
+            loss = criterion(mu, y_b)
+            loss.backward()
+            optimizer.step()
+            
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for X_b, y_b in val_loader:
+                mu = model(X_b)
+                loss = criterion(mu, y_b)
+                val_losses.append(loss.item())
+                
+        val_loss = np.mean(val_losses)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                break
+                
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+            
+    model.eval()
+    val_preds = []
+    val_targets = []
+    with torch.no_grad():
+        for X_b, y_b in val_loader:
+            mu = model(X_b)
+            val_preds.extend(mu.squeeze(-1).numpy())
+            val_targets.extend(y_b.squeeze(-1).numpy())
+            
+    mae = np.mean(np.abs(np.array(val_preds) - np.array(val_targets)))
     return mae, np.array(val_preds)
 
 
@@ -227,8 +306,8 @@ def train_ml_ensemble(X_train_tab, y_train, X_val_tab, y_val):
         'BayesianRidge': BayesianRidge()
     }
     
-    # Enable XGBoost (Colab environment handles it fine)
-    HAS_XGBOOST = True
+    # Disable XGBoost locally to prevent macOS silent segfaults with libomp (1.1)
+    HAS_XGBOOST = False
     
     if HAS_XGBOOST:
         models['XGBoost'] = XGBRegressor(n_estimators=50, random_state=42, objective='reg:squarederror')
@@ -299,7 +378,11 @@ def main():
     from pandas.api.types import is_numeric_dtype
     feature_cols = [c for c in df.columns if c not in ignore_cols and is_numeric_dtype(df[c])]
     
-    seq_len = 8 # Best T chosen in phase 2
+    # ==========================================
+    # DEPENDENCY: T=8 selected via grid search in Phase 2
+    # Results logged empirically showing it minimizes sequence truncation loss.
+    # ==========================================
+    seq_len = 8 # (1.7)
     dl_features = len(feature_cols)
     
     X_seq_all, y_seq_all, X_tab_all, dates_all = [], [], [], []
@@ -349,6 +432,37 @@ def main():
         sys.exit(1)
     target_scaler = joblib.load(scaler_path)
     
+    # ==========================================
+    # 0.5 CROSS-VALIDATION (1.4)
+    # ==========================================
+    from sklearn.model_selection import TimeSeriesSplit
+    logging.info("\n0.5 Running 3-Fold TimeSeriesSplit Cross-Validation for Robustness...")
+    tscv = TimeSeriesSplit(n_splits=3)
+    cv_dl_maes = []
+    cv_ml_maes = []
+    
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X_seq_all), 1):
+        logging.info(f"--- CV Fold {fold} ---")
+        X_dl_tr_cv, X_dl_v_cv = X_seq_all[train_idx], X_seq_all[val_idx]
+        X_ml_tr_cv, X_ml_v_cv = X_tab_all[train_idx], X_tab_all[val_idx]
+        y_tr_cv, y_v_cv = y_seq_all[train_idx], y_seq_all[val_idx]
+        
+        y_tr_cv_scaled = target_scaler.transform(y_tr_cv.reshape(-1, 1)).flatten()
+        y_v_cv_scaled = target_scaler.transform(y_v_cv.reshape(-1, 1)).flatten()
+        
+        # Train DL (Reduced epochs for CV speed)
+        dl_mae_scaled_cv, dl_preds_scaled_cv, _ = train_dl_branch(X_dl_tr_cv, y_tr_cv_scaled, X_dl_v_cv, y_v_cv_scaled, input_size=dl_features, seq_len=seq_len, epochs=15)
+        dl_preds_cv = target_scaler.inverse_transform(dl_preds_scaled_cv.reshape(-1, 1)).flatten()
+        dl_mae_cv = np.mean(np.abs(dl_preds_cv - y_v_cv))
+        cv_dl_maes.append(dl_mae_cv)
+        
+        # Train ML
+        ml_mae_cv, _, _ = train_ml_ensemble(X_ml_tr_cv, y_tr_cv, X_ml_v_cv, y_v_cv)
+        cv_ml_maes.append(ml_mae_cv)
+        
+    logging.info(f" -> Cross-Validation DL Branch MAE: {np.mean(cv_dl_maes):.4f} ± {np.std(cv_dl_maes):.4f}")
+    logging.info(f" -> Cross-Validation ML Ensemble MAE: {np.mean(cv_ml_maes):.4f} ± {np.std(cv_ml_maes):.4f}\n")
+    
     # Verify Distributions
     logging.info("\n--- TARGET DISTRIBUTION VERIFICATION ---")
     logging.info(f"Train Target - Mean: {np.mean(y_train):.2f}, Std: {np.std(y_train):.2f}, Range: [{np.min(y_train):.2f}, {np.max(y_train):.2f}]")
@@ -361,7 +475,7 @@ def main():
     
     # 1. Train Full DL Branch
     logging.info("1. Training Deep Learning Sequence Branch (Full 5 Channels) on SCALED target...")
-    dl_mae_scaled, dl_preds_scaled = train_dl_branch(X_dl_train, y_train_scaled, X_dl_val, y_val_scaled, input_size=dl_features, seq_len=seq_len)
+    dl_mae_scaled, dl_preds_scaled, final_dl_model = train_dl_branch(X_dl_train, y_train_scaled, X_dl_val, y_val_scaled, input_size=dl_features, seq_len=seq_len)
     
     # Inverse transform predictions back to original scale
     dl_preds = target_scaler.inverse_transform(dl_preds_scaled.reshape(-1, 1)).flatten()
@@ -378,6 +492,13 @@ def main():
     plt.close()
     logging.info(" -> Predicted vs Actual plot saved to data/predicted_vs_actual_dl.png\n")
     
+    # 1.5 Train Standalone Transformer Baseline
+    logging.info("1.5 Training Standalone Transformer Baseline (1.2)...")
+    tft_mae_scaled, tft_preds_scaled = train_standalone_transformer(X_dl_train, y_train_scaled, X_dl_val, y_val_scaled, input_size=dl_features, seq_len=seq_len)
+    tft_preds = target_scaler.inverse_transform(tft_preds_scaled.reshape(-1, 1)).flatten()
+    tft_mae = np.mean(np.abs(tft_preds - y_val))
+    logging.info(f" -> Standalone Transformer MAE: {tft_mae:.4f}")
+    
     # Ablation Study
     if args.run_ablation:
         logging.info("--- STARTING CHANNEL ABLATION STUDY ---")
@@ -385,7 +506,7 @@ def main():
         for c in channels:
             ablation_channels = [ch for ch in channels if ch != c]
             logging.info(f"Training WITHOUT {c.upper()} channel...")
-            abl_mae_scaled, abl_preds_scaled = train_dl_branch(X_dl_train, y_train_scaled, X_dl_val, y_val_scaled, input_size=dl_features, seq_len=seq_len, active_channels=ablation_channels)
+            abl_mae_scaled, abl_preds_scaled, _ = train_dl_branch(X_dl_train, y_train_scaled, X_dl_val, y_val_scaled, input_size=dl_features, seq_len=seq_len, active_channels=ablation_channels)
             abl_preds = target_scaler.inverse_transform(abl_preds_scaled.reshape(-1, 1)).flatten()
             abl_mae = np.mean(np.abs(abl_preds - y_val))
             logging.info(f" - MAE w/o {c.upper()}: {abl_mae:.4f} (Delta: {abl_mae - dl_mae:+.4f})")
@@ -434,6 +555,10 @@ def main():
         logging.info(f"\nCONCLUSION: Fixed-Weight (DL={best_w}) performs better on validation data. Use Fixed-Weight for final fusion.")
         final_preds = best_w * dl_preds + (1 - best_w) * ml_preds
         
+    # SAVE MODELS
+    logging.info("\nSaving trained Deep Learning model to models/surecast_dl.pth...")
+    torch.save(final_dl_model.state_dict(), 'models/surecast_dl.pth')
+    
     # SAVE PREDICTIONS FOR PHASE 5
     logging.info("\nSaving predictions to data/model_predictions.csv for Phase 5...")
     best_fixed_preds = best_w * dl_preds + (1 - best_w) * ml_preds
@@ -441,6 +566,7 @@ def main():
         'Actual': y_val,
         'DL_Pred': dl_preds,
         'ML_Pred': ml_preds,
+        'TFT_Pred': tft_preds,
         'Hybrid_Fixed_Pred': best_fixed_preds,
         'Hybrid_Stacking_Pred': stack_pred,
         'Hybrid_Pred': final_preds,

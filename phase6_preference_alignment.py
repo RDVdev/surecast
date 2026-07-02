@@ -6,6 +6,7 @@ import logging
 import argparse
 import shutil
 import random
+import numpy as np
 import sys
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')

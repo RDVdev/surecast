@@ -8,6 +8,44 @@ import os
 import joblib
 from phase4_model_architecture import train_dl_branch
 
+# ==========================================
+# 1.6 Synthetic Disruption Stress Test
+# ==========================================
+def run_synthetic_stress_test(X_test, y_test_orig, model, target_scaler):
+    """
+    Injects a 3x demand shock to 10% of the sequences to simulate a massive supply chain disruption.
+    """
+    import torch
+    logging.info("\n--- Running 1.6 Synthetic Disruption Stress Test ---")
+    
+    X_shocked = X_test.copy()
+    y_shocked = y_test_orig.copy()
+    
+    num_sequences = len(y_shocked)
+    shock_indices = np.random.choice(num_sequences, size=int(num_sequences * 0.1), replace=False)
+    
+    # Apply 3x multiplier to the last 4 timesteps of the selected sequences
+    X_shocked[shock_indices, -4:, 0] *= 3.0 
+    y_shocked[shock_indices] *= 3.0
+    
+    logging.info(f"Injected 3x demand shock into {len(shock_indices)} sequences.")
+    
+    model.eval()
+    with torch.no_grad():
+        preds_clean_scaled = model(torch.tensor(X_test, dtype=torch.float32)).numpy()
+        preds_shocked_scaled = model(torch.tensor(X_shocked, dtype=torch.float32)).numpy()
+    
+    preds_clean = target_scaler.inverse_transform(preds_clean_scaled.reshape(-1, 1)).flatten()
+    preds_shocked = target_scaler.inverse_transform(preds_shocked_scaled.reshape(-1, 1)).flatten()
+    
+    mae_clean = np.mean(np.abs(preds_clean - y_test_orig))
+    mae_shocked = np.mean(np.abs(preds_shocked - y_shocked))
+    
+    logging.info(f"Baseline MAE (No Shock): {mae_clean:.4f}")
+    logging.info(f"Disrupted MAE (With Shock): {mae_shocked:.4f}")
+    logging.info(f"Performance degradation: {((mae_shocked - mae_clean) / mae_clean) * 100:.2f}%\n")
+    return mae_clean, mae_shocked
+
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
 def load_and_prep_data():
@@ -67,7 +105,7 @@ def main():
     logging.info("═══════════════════════════════════════\n")
     
     X_all, y_all, input_size = load_and_prep_data()
-    target_scaler = joblib.load("data/target_scaler.pkl")
+    target_scaler = joblib.load("models/target_scaler.pkl")
     
     # Pre-scale all targets for the DL model
     y_all_scaled = target_scaler.transform(y_all.reshape(-1, 1)).flatten()
@@ -85,7 +123,7 @@ def main():
         set_seed(s)
         logging.info(f" -> Training with seed {s}...")
         # Train for fewer epochs just to check stability efficiently in audit
-        mae_scaled, preds_scaled = train_dl_branch(X_train, y_train_scaled, X_val, y_val_scaled, input_size, seq_len=8, epochs=30)
+        mae_scaled, preds_scaled, _ = train_dl_branch(X_train, y_train_scaled, X_val, y_val_scaled, input_size, seq_len=8, epochs=30)
         preds = target_scaler.inverse_transform(preds_scaled.reshape(-1, 1)).flatten()
         mae_orig = np.mean(np.abs(preds - y_val_orig))
         maes.append(mae_orig)
@@ -111,13 +149,17 @@ def main():
         y_wf_val_orig = y_all[train_end:val_end]
         
         logging.info(f" -> Fold {fold}: Train size = {len(X_wf_train)}, Val size = {len(X_wf_val)}")
-        mae_scaled, preds_scaled = train_dl_branch(X_wf_train, y_wf_train, X_wf_val, y_wf_val, input_size, seq_len=8, epochs=30)
+        mae_scaled, preds_scaled, final_model = train_dl_branch(X_wf_train, y_wf_train, X_wf_val, y_wf_val, input_size, seq_len=8, epochs=30)
         preds = target_scaler.inverse_transform(preds_scaled.reshape(-1, 1)).flatten()
         mae_orig = np.mean(np.abs(preds - y_wf_val_orig))
         wf_maes.append(mae_orig)
         logging.info(f"    Fold {fold} MAE: {mae_orig:.4f}")
         
     logging.info(f"\n[RESULTS] Walk-Forward MAE: Mean = {np.mean(wf_maes):.4f}, Std Dev = {np.std(wf_maes):.4f}")
+    
+    # Run the synthetic stress test using the final fold's model
+    run_synthetic_stress_test(X_wf_val, y_wf_val_orig, final_model, target_scaler)
+    
     logging.info("\nRobustness Audit Complete.")
 
 if __name__ == "__main__":

@@ -187,7 +187,7 @@ def main():
         
     # Valid ARIMA Proxy: Rolling mean of PAST targets only (no lookahead)
     y_pred_arima = pd.Series(y_true).shift(1).rolling(window=2, min_periods=1).mean().fillna(np.mean(y_true)).values
-    y_pred_tft = y_pred_dl # PyTorch branch already includes a Transformer channel
+    y_pred_tft = df['TFT_Pred'].values if 'TFT_Pred' in df.columns else y_pred_dl
     
     logging.info("\n2. Computing Standard Metrics...")
     models = {

@@ -184,13 +184,6 @@ body {
   white-space: pre-wrap;
 }
 
-.terminal-window.error {
-  color: #EF4444;
-}
-
-.terminal-line {
-  margin-bottom: 4px;
-}
 
 /* Custom Scrollbar */
 ::-webkit-scrollbar {

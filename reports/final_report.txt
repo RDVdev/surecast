@@ -1,1 +1,0 @@
-The Full SUREcast Hybrid achieved an R² of 0.90 and a Mean Absolute Error (MAE) of 31.25. The model demonstrates strong robustness with a Resilience Score of 0.86 and maintains a mean prediction uncertainty of 5.23 units.

@@ -13,8 +13,8 @@ PHASE_SCRIPTS = {
     "3": "phase3_feature_engineering.py",
     "4": "phase4_model_architecture.py",
     "5": "phase5_evaluation.py",
-    "6": "phase6_rlhf.py",
-    "7": "phase7_reporting.py"
+    "6": "phase6_preference_alignment.py",
+    "7": "phase7_reporting_layer.py"
 }
 
 @app.route('/api/status', methods=['GET'])
@@ -41,7 +41,7 @@ def run_phase(phase_id):
             ["python3", script_name],
             capture_output=True,
             text=True,
-            cwd=os.path.dirname(os.path.abspath(__name__))
+            cwd=os.path.dirname(os.path.abspath(__file__))
         )
         
         # Combine stdout and stderr for the UI console
