@@ -31,13 +31,13 @@ def create_domain_interactions(df):
     # 1. Sales-Quantity Ratio
     if 'Sales' in df.columns and 'Order Item Quantity' in df.columns:
         # Formula: Sales / (Order Item Quantity + 1e-5)
-        df['Sales_Quantity_Ratio'] = df['Sales'] / (df['Order Item Quantity'] + 1e-5)
+        df['Sales_Quantity_Ratio'] = np.clip(df['Sales'] / (df['Order Item Quantity'] + 1e-5), -1000.0, 1000.0)
         metadata['Sales_Quantity_Ratio'] = "Sales / (Order Item Quantity + 1e-5)"
         
     # 2. Shipping-Benefit Ratio
     if 'Benefit per order' in df.columns and 'Days for shipping (real)' in df.columns:
         # Formula: Benefit per order / (Days for shipping (real) + 1e-5)
-        df['Shipping_Benefit_Ratio'] = df['Benefit per order'] / (df['Days for shipping (real)'] + 1e-5)
+        df['Shipping_Benefit_Ratio'] = np.clip(df['Benefit per order'] / (df['Days for shipping (real)'] + 1e-5), -1000.0, 1000.0)
         metadata['Shipping_Benefit_Ratio'] = "Benefit per order / (Days for shipping (real) + 1e-5)"
         
     # 3. Late Delivery Risk Interaction (if present)
@@ -188,8 +188,8 @@ def main():
     val_df[all_numeric] = num_imputer.transform(val_df[all_numeric])
     val_df[all_numeric] = num_scaler.transform(val_df[all_numeric])
     
-    # Apply to full df
-    df[all_numeric] = num_scaler.transform(num_imputer.transform(df[all_numeric]))
+    # Reconstruct full df from properly-transformed halves (BUG-8 fix: avoids double-transform)
+    df = pd.concat([train_df, val_df], axis=0).sort_index()
     
     # Fit Categorical Pipeline on TRAIN only
     cat_imputer = SimpleImputer(strategy='constant', fill_value='missing')

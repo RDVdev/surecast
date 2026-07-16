@@ -171,7 +171,7 @@ def main(data_path, output_path, output_report_path):
         try:
             dates = pd.to_datetime(df[date_col])
             report.append(f"Time Range Covered: {dates.min().strftime('%Y-%m-%d %H:%M:%S')} to {dates.max().strftime('%Y-%m-%d %H:%M:%S')} (via {date_col})")
-        except:
+        except Exception:
             report.append(f"Time Range Covered: Parsing failed for '{date_col}'")
     else:
         report.append("Time Range Covered: Unknown (Date column not found)")
@@ -182,7 +182,7 @@ def main(data_path, output_path, output_report_path):
     report.append(df[target_col].describe().to_string())
     
     report_text = "\n".join(report)
-    with open(output_report_path, "w") as f:
+    with open(output_report_path, "w", encoding="utf-8") as f:
         f.write(report_text)
         
     logging.info(f"Output Report saved to '{output_report_path}'.")

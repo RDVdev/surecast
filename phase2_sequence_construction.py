@@ -4,14 +4,15 @@ import os
 import sys
 import logging
 import argparse
+import json
 from datetime import datetime
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
-from tqdm import tqdm
 
 import random
+import config
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
@@ -64,11 +65,11 @@ def extract_temporal_features(df, date_col):
     df['quarter_start'] = dates.dt.is_quarter_start.astype(float)
     df['quarter_end'] = dates.dt.is_quarter_end.astype(float)
     
-    # 4. Days since epoch
+    # 4. Days since epoch (raw — normalization deferred to avoid full-data leakage)
     epoch = pd.Timestamp("1970-01-01")
     df['days_since_epoch'] = (dates - epoch).dt.days.astype(float)
-    # Normalize days_since_epoch to avoid large values
-    df['days_since_epoch'] = (df['days_since_epoch'] - df['days_since_epoch'].mean()) / df['days_since_epoch'].std()
+    # NOTE: Normalization is now handled by the StandardScaler in Phase 3
+    # to prevent look-ahead bias from using full-data mean/std.
     
     # Additional 7 features to reach 14
     df['day_of_month_sin'] = np.sin(2 * np.pi * dates.dt.day / dates.dt.daysinmonth)
@@ -153,8 +154,9 @@ def train_eval_model(X_train, y_train, X_val, y_val, input_size, epochs=10):
             out = model(X_batch)
             val_loss += criterion(out, y_batch).item() * len(y_batch)
     
-    mae = val_loss / len(val_dataset)
-    return mae
+    # NOTE: criterion is MSELoss, so this is MSE (not MAE as previously mislabeled)
+    mse = val_loss / len(val_dataset)
+    return mse
 
 def main():
     parser = argparse.ArgumentParser()
@@ -239,8 +241,8 @@ def main():
         return np.array(X), np.array(y)
 
     # Grid Search over T
-    candidate_Ts = [4, 8, 12, 26]
-    best_mae = float('inf')
+    candidate_Ts = config.CANDIDATE_WINDOW_LENGTHS
+    best_mse = float('inf')
     best_T = candidate_Ts[0]
     
     logging.info("\n4. Grid Search Over Window Lengths (T)...")
@@ -271,14 +273,18 @@ def main():
         X_train, X_val = X_all[:split], X_all[split:]
         y_train, y_val = y_all[:split], y_all[split:]
         
-        mae = train_eval_model(X_train, y_train, X_val, y_val, input_size=len(feature_cols))
-        logging.info(f" - Window T={T}: Validation MAE = {mae:.4f}")
+        mse = train_eval_model(X_train, y_train, X_val, y_val, input_size=len(feature_cols))
+        logging.info(f" - Window T={T}: Validation MSE = {mse:.4f}")
         
-        if mae < best_mae:
-            best_mae = mae
+        if mse < best_mse:
+            best_mse = mse
             best_T = T
             
     logging.info(f" -> Best T chosen: {best_T} (Evidence-based selection)")
+    
+    # Persist best_T for Phase 4 (ARCH-1 fix)
+    config.save_best_seq_len(best_T)
+    logging.info(f" -> Saved best_T={best_T} to {config.BEST_SEQ_LEN_PATH}")
     
     # 5. Direct Empirical Comparison (Degenerate vs Best T)
     logging.info("\n5. Running Direct Empirical Comparison (T=1 vs New Format)")
@@ -298,11 +304,11 @@ def main():
     X_train_1, X_val_1 = X_all_1[:split_1], X_all_1[split_1:]
     y_train_1, y_val_1 = y_all_1[:split_1], y_all_1[split_1:]
     
-    mae_degenerate = train_eval_model(X_train_1, y_train_1, X_val_1, y_val_1, input_size=len(feature_cols))
+    mse_degenerate = train_eval_model(X_train_1, y_train_1, X_val_1, y_val_1, input_size=len(feature_cols))
     
-    logging.info(f" - Model (T=1, Degenerate): Val MAE = {mae_degenerate:.4f}")
-    logging.info(f" - Model (T={best_T}, Sequence): Val MAE = {best_mae:.4f}")
-    logging.info(f" -> EMPIRICAL EVIDENCE: Sequence fix changed MAE by {best_mae - mae_degenerate:.4f}")
+    logging.info(f" - Model (T=1, Degenerate): Val MSE = {mse_degenerate:.4f}")
+    logging.info(f" - Model (T={best_T}, Sequence): Val MSE = {best_mse:.4f}")
+    logging.info(f" -> EMPIRICAL EVIDENCE: Sequence fix changed MSE by {best_mse - mse_degenerate:.4f}")
     
     logging.info("\nPhase 2 Complete. Sequence Construction logic is empirically validated.")
 
