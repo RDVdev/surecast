@@ -1,22 +1,30 @@
+"""
+Robustness Audit — Multi-seed sensitivity, walk-forward CV, and stress testing.
+Uses shared data_utils to eliminate duplicated sequence-building code.
+"""
 import numpy as np
-import pandas as pd
 import torch
 import logging
-import argparse
 import sys
 import os
 import joblib
+
+import config
+import data_utils
 from phase4_model_architecture import train_dl_branch
 
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+
 # ==========================================
-# 1.6 Synthetic Disruption Stress Test
+# Synthetic Disruption Stress Test
 # ==========================================
-def run_synthetic_stress_test(X_test, y_test_orig, model, target_scaler):
+
+def run_synthetic_stress_test(X_test, y_test_orig, model, target_scaler, device=None):
     """
-    Injects a 3x demand shock to 10% of the sequences to simulate a massive supply chain disruption.
+    Injects a 3x demand shock to 10% of sequences to simulate supply chain disruption.
     """
-    import torch
-    logging.info("\n--- Running 1.6 Synthetic Disruption Stress Test ---")
+    device = device or config.DEVICE
+    logging.info("\n--- Synthetic Disruption Stress Test ---")
     
     X_shocked = X_test.copy()
     y_shocked = y_test_orig.copy()
@@ -25,15 +33,16 @@ def run_synthetic_stress_test(X_test, y_test_orig, model, target_scaler):
     shock_indices = np.random.choice(num_sequences, size=int(num_sequences * 0.1), replace=False)
     
     # Apply 3x multiplier to the last 4 timesteps of the selected sequences
-    X_shocked[shock_indices, -4:, 0] *= 3.0 
+    X_shocked[shock_indices, -4:, 0] *= 3.0
     y_shocked[shock_indices] *= 3.0
     
     logging.info(f"Injected 3x demand shock into {len(shock_indices)} sequences.")
     
+    model = model.to(device)
     model.eval()
     with torch.no_grad():
-        preds_clean_scaled = model(torch.tensor(X_test, dtype=torch.float32)).numpy()
-        preds_shocked_scaled = model(torch.tensor(X_shocked, dtype=torch.float32)).numpy()
+        preds_clean_scaled = model(torch.tensor(X_test, dtype=torch.float32).to(device)).cpu().numpy()
+        preds_shocked_scaled = model(torch.tensor(X_shocked, dtype=torch.float32).to(device)).cpu().numpy()
     
     preds_clean = target_scaler.inverse_transform(preds_clean_scaled.reshape(-1, 1)).flatten()
     preds_shocked = target_scaler.inverse_transform(preds_shocked_scaled.reshape(-1, 1)).flatten()
@@ -43,125 +52,95 @@ def run_synthetic_stress_test(X_test, y_test_orig, model, target_scaler):
     
     logging.info(f"Baseline MAE (No Shock): {mae_clean:.4f}")
     logging.info(f"Disrupted MAE (With Shock): {mae_shocked:.4f}")
-    logging.info(f"Performance degradation: {((mae_shocked - mae_clean) / mae_clean) * 100:.2f}%\n")
+    degradation = ((mae_shocked - mae_clean) / mae_clean) * 100
+    logging.info(f"Performance degradation: {degradation:.2f}%\n")
     return mae_clean, mae_shocked
 
-logging.basicConfig(level=logging.INFO, format='%(message)s')
-
-def load_and_prep_data():
-    data_path = "data/engineered_dataset.csv"
-    if not os.path.exists(data_path):
-        logging.error(f"[ERROR] Required dataset '{data_path}' not found.")
-        sys.exit(1)
-        
-    df = pd.read_csv(data_path)
-    target_col = "Sales"
-    date_col = next((c for c in df.columns if 'date' in c.lower()), None)
-    cat_group = next((c for c in df.columns if 'category' in c.lower()), None)
-    region_group = next((c for c in df.columns if 'region' in c.lower()), None)
-    
-    ignore_cols = [target_col, cat_group, region_group, date_col, 'YearWeek']
-    from pandas.api.types import is_numeric_dtype
-    feature_cols = [c for c in df.columns if c not in ignore_cols and is_numeric_dtype(df[c])]
-    
-    seq_len = 8
-    X_seq_all, y_seq_all, dates_all = [], [], []
-    
-    for _, group in df.groupby([cat_group, region_group]):
-        vals = group[feature_cols].values
-        targets = group[target_col].values
-        dates = group[date_col].values
-        
-        if len(vals) < seq_len:
-            pad_len = seq_len - len(vals)
-            pad_vals = np.full((pad_len, vals.shape[1]), 0.0)
-            vals = np.vstack([pad_vals, vals])
-            pad_target = np.full((pad_len,), 0.0)
-            targets = np.concatenate([pad_target, targets])
-            pad_dates = np.full((pad_len,), dates[0])
-            dates = np.concatenate([pad_dates, dates])
-            
-        for i in range(len(vals) - seq_len):
-            X_seq_all.append(vals[i:i+seq_len])
-            y_seq_all.append(targets[i+seq_len])
-            dates_all.append(dates[i+seq_len])
-            
-    sort_idx = np.argsort(np.array(dates_all))
-    X_seq_all = np.array(X_seq_all)[sort_idx]
-    y_seq_all = np.array(y_seq_all)[sort_idx]
-    return X_seq_all, y_seq_all, len(feature_cols)
-
-def set_seed(seed):
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 def main():
     logging.info("═══════════════════════════════════════")
     logging.info("ROBUSTNESS AUDIT: Deep Learning Branch")
     logging.info("═══════════════════════════════════════\n")
     
-    X_all, y_all, input_size = load_and_prep_data()
-    target_scaler = joblib.load("models/target_scaler.pkl")
+    data_utils.set_seed()
+    device = config.DEVICE
+    logging.info(f"Using device: {device}\n")
     
-    # Pre-scale all targets for the DL model
+    # Load data using shared utilities (eliminates duplicated code)
+    try:
+        X_all, y_all, _, feature_cols, cols = data_utils.load_and_build_data()
+    except FileNotFoundError:
+        logging.error("[ERROR] Missing engineered dataset. Run Phase 3 first.")
+        sys.exit(1)
+    
+    input_size = len(feature_cols)
+    seq_len = config.load_best_seq_len()
+    target_scaler = joblib.load(config.TARGET_SCALER_PATH)
+    
     y_all_scaled = target_scaler.transform(y_all.reshape(-1, 1)).flatten()
     
-    split_idx = int(len(X_all) * 0.8)
-    X_train, X_val = X_all[:split_idx], X_all[split_idx:]
-    y_train_scaled, y_val_scaled = y_all_scaled[:split_idx], y_all_scaled[split_idx:]
-    y_val_orig = y_all[split_idx:]
+    # Use proper 3-way split
+    splits = data_utils.temporal_train_val_test_split(X_all, y_all)
+    X_train = splits['train']['X_seq']
+    X_val = splits['val']['X_seq']
+    y_train_scaled = target_scaler.transform(splits['train']['y'].reshape(-1, 1)).flatten()
+    y_val_scaled = target_scaler.transform(splits['val']['y'].reshape(-1, 1)).flatten()
+    y_val_orig = splits['val']['y']
     
+    # 1. Initialization Sensitivity (5 Random Seeds)
     logging.info("1. Initialization Sensitivity (5 Random Seeds)")
     seeds = [42, 100, 2026, 777, 12345]
     maes = []
     
     for s in seeds:
-        set_seed(s)
+        data_utils.set_seed(s)
         logging.info(f" -> Training with seed {s}...")
-        # Train for fewer epochs just to check stability efficiently in audit
-        mae_scaled, preds_scaled, _ = train_dl_branch(X_train, y_train_scaled, X_val, y_val_scaled, input_size, seq_len=8, epochs=30)
+        mae_scaled, preds_scaled, _ = train_dl_branch(
+            X_train, y_train_scaled, X_val, y_val_scaled,
+            input_size, seq_len=seq_len, epochs=30, device=device)
         preds = target_scaler.inverse_transform(preds_scaled.reshape(-1, 1)).flatten()
         mae_orig = np.mean(np.abs(preds - y_val_orig))
         maes.append(mae_orig)
         logging.info(f"    Validation MAE: {mae_orig:.4f}")
         
-    logging.info(f"\n[RESULTS] 5-Seed MAE: Mean = {np.mean(maes):.4f}, Std Dev = {np.std(maes):.4f}")
+    logging.info(f"\n[RESULTS] 5-Seed MAE: Mean = {np.mean(maes):.4f}, Std = {np.std(maes):.4f}")
     
+    # 2. Walk-Forward Validation (3 Folds)
     logging.info("\n2. Walk-Forward Validation (3 Folds)")
-    # Split the timeline into 4 chunks: Train1, Val1, Val2, Val3
     chunk_size = int(len(X_all) * 0.25)
     wf_maes = []
+    final_model = None
     
     for fold in range(1, 4):
-        set_seed(42)
+        data_utils.set_seed()
         train_end = chunk_size * fold
         val_end = chunk_size * (fold + 1)
         
         X_wf_train = X_all[:train_end]
         y_wf_train = y_all_scaled[:train_end]
-        
         X_wf_val = X_all[train_end:val_end]
         y_wf_val = y_all_scaled[train_end:val_end]
         y_wf_val_orig = y_all[train_end:val_end]
         
-        logging.info(f" -> Fold {fold}: Train size = {len(X_wf_train)}, Val size = {len(X_wf_val)}")
-        mae_scaled, preds_scaled, final_model = train_dl_branch(X_wf_train, y_wf_train, X_wf_val, y_wf_val, input_size, seq_len=8, epochs=30)
+        logging.info(f" -> Fold {fold}: Train={len(X_wf_train)}, Val={len(X_wf_val)}")
+        mae_scaled, preds_scaled, final_model = train_dl_branch(
+            X_wf_train, y_wf_train, X_wf_val, y_wf_val,
+            input_size, seq_len=seq_len, epochs=30, device=device)
         preds = target_scaler.inverse_transform(preds_scaled.reshape(-1, 1)).flatten()
         mae_orig = np.mean(np.abs(preds - y_wf_val_orig))
         wf_maes.append(mae_orig)
         logging.info(f"    Fold {fold} MAE: {mae_orig:.4f}")
         
-    logging.info(f"\n[RESULTS] Walk-Forward MAE: Mean = {np.mean(wf_maes):.4f}, Std Dev = {np.std(wf_maes):.4f}")
+    logging.info(f"\n[RESULTS] Walk-Forward MAE: Mean = {np.mean(wf_maes):.4f}, Std = {np.std(wf_maes):.4f}")
     
-    # Run the synthetic stress test using the final fold's model
-    run_synthetic_stress_test(X_wf_val, y_wf_val_orig, final_model, target_scaler)
+    # 3. Synthetic Stress Test
+    if final_model is not None:
+        X_wf_val = X_all[chunk_size * 3:]
+        y_wf_val_orig = y_all[chunk_size * 3:]
+        run_synthetic_stress_test(X_wf_val, y_wf_val_orig, final_model, target_scaler, device)
     
     logging.info("\nRobustness Audit Complete.")
 
 if __name__ == "__main__":
-    set_seed(42)
+    data_utils.set_seed()
     main()

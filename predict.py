@@ -1,78 +1,87 @@
-import os
-import sys
+"""
+Single-sample inference test.
+BUG-14 fix: torch.load uses weights_only=True.
+ARCH-9: Added device support.
+"""
+import torch
 import numpy as np
 import pandas as pd
-import torch
 import joblib
-from pandas.api.types import is_numeric_dtype
+import logging
+import os
+import sys
 
-# Import the model architecture
+import config
+import data_utils
 from phase4_model_architecture import MultiBranchSequenceModel
 
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+
+
+def predict_single_sample(model, sample_seq, target_scaler, device=None):
+    """Run inference on a single sequence sample."""
+    device = device or config.DEVICE
+    model = model.to(device)
+    model.eval()
+    
+    if isinstance(sample_seq, np.ndarray):
+        sample_seq = torch.tensor(sample_seq, dtype=torch.float32)
+    
+    if sample_seq.dim() == 2:
+        sample_seq = sample_seq.unsqueeze(0)  # add batch dim
+    
+    sample_seq = sample_seq.to(device)
+    
+    with torch.no_grad():
+        mu_scaled = model(sample_seq)
+    
+    mu_original = target_scaler.inverse_transform(
+        mu_scaled.cpu().numpy().reshape(-1, 1)
+    ).flatten()[0]
+    
+    return mu_original
+
+
 def main():
-    print("==================================================")
-    print("SUREcast Inference Test Case")
-    print("==================================================")
+    data_utils.set_seed()
+    device = config.DEVICE
+    logging.info(f"Using device: {device}")
     
-    model_path = "models/surecast_dl.pth"
-    scaler_path = "models/target_scaler.pkl"
-    data_path = "data/engineered_dataset.csv"
-    
-    if not os.path.exists(model_path):
-        print(f"[ERROR] Model file {model_path} not found.")
-        print("Please run phase 4 (or run_pipeline.py) first to generate and save the model.")
+    # Load data
+    try:
+        X_seq_all, y_seq_all, _, feature_cols, cols = data_utils.load_and_build_data()
+    except FileNotFoundError:
+        logging.error("Missing engineered dataset. Run Phase 3 first.")
         sys.exit(1)
-        
-    print("1. Loading required scalers and determining features...")
-    target_scaler = joblib.load(scaler_path)
     
-    # Load dataset just to get the exact feature columns we trained on
-    df = pd.read_csv(data_path, nrows=50) # only need a small chunk
-    target_col = "Sales"
-    if target_col not in df.columns:
-        target_col = next((c for c in ['Sales per customer','Order Item Quantity'] if c in df.columns), df.columns[-1])
-    date_col = next((c for c in df.columns if 'date' in c.lower()), None)
-    cat_group = 'Category Name' if 'Category Name' in df.columns else next((c for c in df.columns if 'category' in c.lower()), None)
-    region_group = 'Order Region' if 'Order Region' in df.columns else next((c for c in df.columns if 'region' in c.lower()), None)
+    seq_len = config.load_best_seq_len()
+    input_size = len(feature_cols)
     
-    ignore_cols = [target_col, cat_group, region_group, date_col, 'YearWeek']
-    feature_cols = [c for c in df.columns if c not in ignore_cols and is_numeric_dtype(df[c])]
+    # Load model
+    if not os.path.exists(config.DL_MODEL_PATH):
+        logging.error(f"Missing model at {config.DL_MODEL_PATH}. Run Phase 4 first.")
+        sys.exit(1)
     
-    seq_len = 8
-    dl_features = len(feature_cols)
+    model = MultiBranchSequenceModel(input_size=input_size, seq_len=seq_len)
+    # BUG-14 fix: weights_only=True for security
+    model.load_state_dict(torch.load(config.DL_MODEL_PATH, weights_only=True,
+                                      map_location=device))
     
-    print("2. Initializing Model Architecture...")
-    # Initialize the architecture (Must match what we trained!)
-    model = MultiBranchSequenceModel(input_size=dl_features, seq_len=seq_len)
+    # Load scaler
+    target_scaler = joblib.load(config.TARGET_SCALER_PATH)
     
-    # Load the saved brain/weights into the model
-    model.load_state_dict(torch.load(model_path))
-    model.eval() # Set model to evaluation mode (turns off dropout)
-    print(" -> Model loaded successfully!")
+    # Test prediction on last sample
+    test_sample = X_seq_all[-1]
+    actual = y_seq_all[-1]
     
-    print("\n3. Formatting Sample New Data...")
-    # For this test case, we will simulate receiving the last 8 days of data for a specific product
-    # In a real system, you would load this from your live database.
-    # We grab 8 rows of real features from our dataset to act as the "new" sequence
-    sample_data_raw = df[feature_cols].values[:seq_len]
+    prediction = predict_single_sample(model, test_sample, target_scaler, device)
     
-    # The PyTorch model expects shape: (batch_size, sequence_length, features)
-    # We have 1 sample, 8 days, and 'dl_features' columns
-    sample_tensor = torch.tensor(sample_data_raw, dtype=torch.float32).unsqueeze(0) 
-    
-    print(f" -> Sample data shape: {sample_tensor.shape}")
-    
-    print("\n4. Running Prediction...")
-    with torch.no_grad(): # Don't track gradients during inference (saves memory/time)
-        scaled_prediction = model(sample_tensor)
-        
-    # The model outputs a scaled prediction, we need to convert it back to actual Sales dollars
-    scaled_value = scaled_prediction.numpy()[0][0]
-    actual_sales_prediction = target_scaler.inverse_transform([[scaled_value]])[0][0]
-    
-    print("==================================================")
-    print(f"RESULT: The model predicts the next period's sales will be: ${actual_sales_prediction:.2f}")
-    print("==================================================")
+    logging.info(f"\n=== Single Sample Prediction ===")
+    logging.info(f"Actual:     {actual:.4f}")
+    logging.info(f"Predicted:  {prediction:.4f}")
+    logging.info(f"Error:      {abs(prediction - actual):.4f}")
+    logging.info(f"================================")
+
 
 if __name__ == "__main__":
     main()
